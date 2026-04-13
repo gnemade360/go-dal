@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/airoles/go-dal/dal/errors"
-	"github.com/airoles/go-dal/dal/interfaces"
-	"github.com/airoles/go-dal/dal/types"
+	"github.com/gnemade360/go-dal/dal/errors"
+	"github.com/gnemade360/go-dal/dal/interfaces"
+	"github.com/gnemade360/go-dal/dal/types"
 )
 
 // BaseRepository provides a generic repository implementation
@@ -64,7 +64,7 @@ func (r *BaseRepository[T]) FindAll(ctx context.Context, opts ...QueryOption) ([
 	}
 	defer rows.Close()
 	
-	var entities []*T
+	entities := make([]*T, 0)
 	for rows.Next() {
 		entity, err := r.mapper.FromRow(rows)
 		if err != nil {
@@ -72,11 +72,11 @@ func (r *BaseRepository[T]) FindAll(ctx context.Context, opts ...QueryOption) ([
 		}
 		entities = append(entities, entity)
 	}
-	
+
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	
+
 	return entities, nil
 }
 
@@ -86,24 +86,24 @@ func (r *BaseRepository[T]) FindBySpec(ctx context.Context, spec Specification, 
 	for _, opt := range opts {
 		opt(options)
 	}
-	
+
 	query := r.buildSelectQuery(options)
 	whereClause, args := r.buildWhereClause(spec)
-	
+
 	if whereClause != "" {
 		query += " WHERE " + whereClause
 	}
-	
+
 	// Add ORDER BY, LIMIT, OFFSET
 	query += r.buildQuerySuffix(options)
-	
+
 	rows, err := r.db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	
-	var entities []*T
+
+	entities := make([]*T, 0)
 	for rows.Next() {
 		entity, err := r.mapper.FromRow(rows)
 		if err != nil {
