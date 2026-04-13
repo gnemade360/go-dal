@@ -3,7 +3,7 @@ package unitofwork
 import (
 	"context"
 
-	"github.com/airoles/go-dal/repository"
+	"github.com/gnemade360/go-dal/repository"
 )
 
 // UnitOfWork represents a unit of work pattern

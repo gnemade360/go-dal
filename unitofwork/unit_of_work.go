@@ -6,7 +6,7 @@ import (
 	"reflect"
 	"sync"
 
-	"github.com/airoles/go-dal/dal/interfaces"
+	"github.com/gnemade360/go-dal/dal/interfaces"
 )
 
 // BaseUnitOfWork provides a base implementation of UnitOfWork

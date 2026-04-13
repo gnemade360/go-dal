@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/airoles/go-dal/dal/interfaces"
+	"github.com/gnemade360/go-dal/dal/interfaces"
 )
 
 // Specification represents a query specification

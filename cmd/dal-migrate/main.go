@@ -1,19 +1,22 @@
 package main
 
 import (
-	"context"
-	"fmt"
-	"os"
-	"path/filepath"
-	"strconv"
-	"strings"
-	"text/tabwriter"
-	"time"
-	
-	"github.com/airoles/go-dal/migration"
-	"github.com/airoles/go-dal/migration/providers/sqlite"
-	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
+    "crypto/sha256"
+    "context"
+    "fmt"
+    "os"
+    "path/filepath"
+    "regexp"
+    "sort"
+    "strconv"
+    "strings"
+    "text/tabwriter"
+    "time"
+
+    "github.com/gnemade360/go-dal/migration"
+    "github.com/gnemade360/go-dal/migration/providers/sqlite"
+    "github.com/spf13/cobra"
+    "github.com/spf13/viper"
 )
 
 var (
@@ -74,18 +77,24 @@ var (
 )
 
 func init() {
-	cobra.OnInitialize(initConfig)
-	
-	// Global flags
-	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is .migrate.yml)")
-	rootCmd.PersistentFlags().StringVar(&dsn, "dsn", "", "database connection string")
-	rootCmd.PersistentFlags().StringVar(&driver, "driver", "sqlite3", "database driver (sqlite3, postgres, mysql)")
+    cobra.OnInitialize(initConfig)
+    
+    // Global flags
+    rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is .migrate.yml)")
+    rootCmd.PersistentFlags().StringVar(&dsn, "dsn", "", "database connection string")
+    rootCmd.PersistentFlags().StringVar(&driver, "driver", "sqlite3", "database driver (sqlite3, postgres, mysql)")
 	rootCmd.PersistentFlags().StringVar(&tableName, "table", "schema_migrations", "migrations table name")
-	
-	// Bind flags to viper
-	viper.BindPFlag("database.dsn", rootCmd.PersistentFlags().Lookup("dsn"))
-	viper.BindPFlag("database.driver", rootCmd.PersistentFlags().Lookup("driver"))
+	rootCmd.PersistentFlags().String("migrations", "./migrations", "path to SQL migrations directory")
+	rootCmd.PersistentFlags().Bool("forward-only", false, "disable rollbacks (down/downTo)")
+	rootCmd.PersistentFlags().Bool("require-down", true, "error if a down script is missing when rolling back")
+    
+    // Bind flags to viper
+    viper.BindPFlag("database.dsn", rootCmd.PersistentFlags().Lookup("dsn"))
+    viper.BindPFlag("database.driver", rootCmd.PersistentFlags().Lookup("driver"))
 	viper.BindPFlag("migrations.table", rootCmd.PersistentFlags().Lookup("table"))
+	viper.BindPFlag("migrations.path", rootCmd.PersistentFlags().Lookup("migrations"))
+	viper.BindPFlag("migrations.forward_only", rootCmd.PersistentFlags().Lookup("forward-only"))
+	viper.BindPFlag("migrations.require_down", rootCmd.PersistentFlags().Lookup("require-down"))
 	
 	// Add commands
 	rootCmd.AddCommand(upCmd)
@@ -170,25 +179,237 @@ func getMigrator() (migration.Migrator, error) {
 }
 
 func loadMigrations(migrator migration.Migrator) error {
-	// This is a placeholder - in real use, this would be implemented
-	// by the project using the migration tool
-	fmt.Println("Loading migrations from filesystem...")
-	
-	// Look for migrations in ./migrations directory
-	migrationsPath := viper.GetString("migrations.path")
-	if migrationsPath == "" {
-		migrationsPath = "./migrations"
-	}
-	
-	// Check if directory exists
-	if _, err := os.Stat(migrationsPath); os.IsNotExist(err) {
-		return fmt.Errorf("migrations directory not found: %s", migrationsPath)
-	}
-	
-	// Note: Actual migration loading would be implemented here
-	// This would read .sql files and create Migration structs
-	
-	return nil
+    fmt.Println("Loading migrations from filesystem...")
+
+    // Get configured path
+    migrationsPath := viper.GetString("migrations.path")
+    if migrationsPath == "" {
+        migrationsPath = "./migrations"
+    }
+
+    info, err := os.Stat(migrationsPath)
+    if err != nil || !info.IsDir() {
+        return fmt.Errorf("migrations directory not found: %s", migrationsPath)
+    }
+
+    // Match files:
+    // - Timestamp style: 20060102150405_name.up.sql / .down.sql
+    // - Flyway style: V<ver>__name.sql (up), U<ver>__name.sql (down)
+    reTs := regexp.MustCompile(`^(?P<ver>\d{14})_(?P<name>[A-Za-z0-9_]+)\.(?P<dir>up|down)\.sql$`)
+    reFlyUp := regexp.MustCompile(`^V(?P<ver>\d+)__(?P<name>[A-Za-z0-9_]+)\.sql$`)
+    reFlyDown := regexp.MustCompile(`^U(?P<ver>\d+)__(?P<name>[A-Za-z0-9_]+)\.sql$`)
+
+    type pair struct {
+        name    string
+        upFile  string
+        downFile string
+    }
+    pairs := map[int64]*pair{}
+
+    entries, err := os.ReadDir(migrationsPath)
+    if err != nil {
+        return fmt.Errorf("failed to read migrations dir: %w", err)
+    }
+
+    for _, e := range entries {
+        if e.IsDir() {
+            continue
+        }
+        fname := e.Name()
+        var versionStr, migName, dir string
+        matched := false
+
+        if m := reTs.FindStringSubmatch(fname); m != nil {
+            versionStr = m[reTs.SubexpIndex("ver")]
+            migName = m[reTs.SubexpIndex("name")]
+            dir = m[reTs.SubexpIndex("dir")]
+            matched = true
+        } else if m := reFlyUp.FindStringSubmatch(fname); m != nil {
+            versionStr = m[reFlyUp.SubexpIndex("ver")]
+            migName = m[reFlyUp.SubexpIndex("name")]
+            dir = "up"
+            matched = true
+        } else if m := reFlyDown.FindStringSubmatch(fname); m != nil {
+            versionStr = m[reFlyDown.SubexpIndex("ver")]
+            migName = m[reFlyDown.SubexpIndex("name")]
+            dir = "down"
+            matched = true
+        }
+        if !matched {
+            continue
+        }
+
+        ver, err := strconv.ParseInt(versionStr, 10, 64)
+        if err != nil {
+            return fmt.Errorf("invalid migration version in %s: %w", fname, err)
+        }
+
+        p, ok := pairs[ver]
+        if !ok {
+            p = &pair{name: migName}
+            pairs[ver] = p
+        }
+        path := filepath.Join(migrationsPath, fname)
+        if dir == "up" {
+            if p.upFile != "" {
+                return fmt.Errorf("duplicate up migration for version %d (%s)", ver, migName)
+            }
+            p.upFile = path
+        } else {
+            if p.downFile != "" {
+                return fmt.Errorf("duplicate down migration for version %d (%s)", ver, migName)
+            }
+            p.downFile = path
+        }
+    }
+
+    // Sort versions for deterministic registration
+    var versions []int64
+    for v := range pairs {
+        versions = append(versions, v)
+    }
+    sort.Slice(versions, func(i, j int) bool { return versions[i] < versions[j] })
+
+    // Register migrations
+    for _, v := range versions {
+        p := pairs[v]
+        if p.upFile == "" {
+            return fmt.Errorf("missing .up.sql for version %d (%s)", v, p.name)
+        }
+
+        upPath := p.upFile
+        downPath := p.downFile // may be empty
+
+        // Capture for closures
+        name := strings.ReplaceAll(p.name, "_", " ")
+
+        // Precompute checksum from up script content
+        upContent, err := os.ReadFile(upPath)
+        if err != nil {
+            return fmt.Errorf("read up file for checksum: %w", err)
+        }
+        sum := sha256.Sum256(upContent)
+
+        mig := migration.Migration{
+            Version:     v,
+            Name:        name,
+            Description: "",
+            Checksum:    fmt.Sprintf("%x", sum[:]),
+            Up: func(ctx context.Context, tx migration.Transaction) error {
+                sqlText, err := os.ReadFile(upPath)
+                if err != nil {
+                    return fmt.Errorf("read up file: %w", err)
+                }
+                return execSQLScript(ctx, tx, string(sqlText))
+            },
+            Down: func(ctx context.Context, tx migration.Transaction) error {
+                if downPath == "" {
+                    if viper.GetBool("migrations.require_down") {
+                        return fmt.Errorf("missing down script for version %d (%s)", v, p.name)
+                    }
+                    // No-op if not required
+                    return nil
+                }
+                sqlText, err := os.ReadFile(downPath)
+                if err != nil {
+                    return fmt.Errorf("read down file: %w", err)
+                }
+                return execSQLScript(ctx, tx, string(sqlText))
+            },
+        }
+
+        migrator.AddMigration(mig)
+    }
+
+    return nil
+}
+
+// execSQLScript executes a SQL script by splitting statements safely on semicolons.
+func execSQLScript(ctx context.Context, tx migration.Transaction, script string) error {
+    statements := splitSQLStatements(script)
+    for _, s := range statements {
+        if strings.TrimSpace(s) == "" {
+            continue
+        }
+        if _, err := tx.Execute(ctx, s); err != nil {
+            return err
+        }
+    }
+    return nil
+}
+
+// splitSQLStatements splits a SQL string into statements, respecting quotes and comments.
+func splitSQLStatements(sql string) []string {
+    var out []string
+    var buf strings.Builder
+    inSingle := false
+    inDouble := false
+    inLineComment := false
+    inBlockComment := false
+
+    for i := 0; i < len(sql); i++ {
+        c := sql[i]
+        next := byte(0)
+        if i+1 < len(sql) {
+            next = sql[i+1]
+        }
+
+        // Handle line comment end
+        if inLineComment {
+            if c == '\n' {
+                inLineComment = false
+                buf.WriteByte(c)
+            }
+            continue
+        }
+        // Handle block comment end
+        if inBlockComment {
+            if c == '*' && next == '/' {
+                inBlockComment = false
+                i++ // consume '/'
+            }
+            continue
+        }
+
+        // Enter comments (when not in quotes)
+        if !inSingle && !inDouble {
+            if c == '-' && next == '-' {
+                inLineComment = true
+                i++ // consume second '-'
+                continue
+            }
+            if c == '/' && next == '*' {
+                inBlockComment = true
+                i++ // consume '*'
+                continue
+            }
+        }
+
+        // Toggle quotes
+        if !inDouble && c == '\'' {
+            inSingle = !inSingle
+            buf.WriteByte(c)
+            continue
+        }
+        if !inSingle && c == '"' {
+            inDouble = !inDouble
+            buf.WriteByte(c)
+            continue
+        }
+
+        // Split on semicolon when not inside quotes/comments
+        if c == ';' && !inSingle && !inDouble {
+            out = append(out, buf.String())
+            buf.Reset()
+            continue
+        }
+
+        buf.WriteByte(c)
+    }
+    if strings.TrimSpace(buf.String()) != "" {
+        out = append(out, buf.String())
+    }
+    return out
 }
 
 func runUp(cmd *cobra.Command, args []string) error {
@@ -208,17 +429,20 @@ func runUp(cmd *cobra.Command, args []string) error {
 }
 
 func runDown(cmd *cobra.Command, args []string) error {
-	migrator, err := getMigrator()
-	if err != nil {
-		return err
-	}
+    if viper.GetBool("migrations.forward_only") {
+        return fmt.Errorf("down is disabled in forward-only mode")
+    }
+    migrator, err := getMigrator()
+    if err != nil {
+        return err
+    }
 	
 	ctx := context.Background()
 	
-	// Check if rolling back to specific version
-	if to, _ := cmd.Flags().GetInt64("to"); to >= 0 {
-		return migrator.DownTo(ctx, to)
-	}
+    // Check if rolling back to specific version
+    if to, _ := cmd.Flags().GetInt64("to"); to >= 0 {
+        return migrator.DownTo(ctx, to)
+    }
 	
 	return migrator.Down(ctx)
 }

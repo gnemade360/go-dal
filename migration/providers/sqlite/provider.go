@@ -7,7 +7,7 @@ import (
 	"time"
 	
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/airoles/go-dal/migration"
+	"github.com/gnemade360/go-dal/migration"
 )
 
 // Provider implements the migration.Provider interface for SQLite

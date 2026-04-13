@@ -1,6 +1,6 @@
 package repository
 
-import "github.com/airoles/go-dal/dal/types"
+import "github.com/gnemade360/go-dal/dal/types"
 
 // QueryOption configures query behavior
 type QueryOption func(*types.QueryOptions)
