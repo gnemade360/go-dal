@@ -5,16 +5,21 @@ import (
 	"database/sql"
 	"fmt"
 	"time"
-	
-	_ "github.com/mattn/go-sqlite3"
+
 	"github.com/gnemade360/go-dal/migration"
 )
 
+// defaultDriverName matches the dal/providers/sqlite default. Callers must
+// blank-import the driver themselves (mattn/go-sqlite3 or modernc.org/sqlite)
+// and call WithDriver if using a non-default name.
+const defaultDriverName = "sqlite3"
+
 // Provider implements the migration.Provider interface for SQLite
 type Provider struct {
-	db        *sql.DB
-	dsn       string
-	tableName string
+	db         *sql.DB
+	dsn        string
+	tableName  string
+	driverName string
 }
 
 // NewProvider creates a new SQLite migration provider
@@ -22,26 +27,40 @@ func NewProvider(dsn string, tableName string) *Provider {
 	if tableName == "" {
 		tableName = "schema_migrations"
 	}
-	
+
 	return &Provider{
-		dsn:       dsn,
-		tableName: tableName,
+		dsn:        dsn,
+		tableName:  tableName,
+		driverName: defaultDriverName,
 	}
+}
+
+// WithDriver overrides the database/sql driver name. Use "sqlite" for
+// modernc.org/sqlite (pure-Go), "sqlite3" for mattn (CGO).
+func (p *Provider) WithDriver(name string) *Provider {
+	if name != "" {
+		p.driverName = name
+	}
+	return p
 }
 
 // Connect establishes a database connection
 func (p *Provider) Connect(ctx context.Context) error {
-	db, err := sql.Open("sqlite3", p.dsn)
+	driver := p.driverName
+	if driver == "" {
+		driver = defaultDriverName
+	}
+	db, err := sql.Open(driver, p.dsn)
 	if err != nil {
 		return fmt.Errorf("failed to open database: %w", err)
 	}
-	
+
 	// Test connection
 	if err := db.PingContext(ctx); err != nil {
 		db.Close()
 		return fmt.Errorf("failed to ping database: %w", err)
 	}
-	
+
 	p.db = db
 	return nil
 }
