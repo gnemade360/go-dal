@@ -15,6 +15,7 @@ import (
 
     "github.com/gnemade360/go-dal/migration"
     "github.com/gnemade360/go-dal/migration/providers/sqlite"
+    _ "github.com/mattn/go-sqlite3"
     "github.com/spf13/cobra"
     "github.com/spf13/viper"
 )

@@ -5,17 +5,36 @@ import (
 	"database/sql"
 	"fmt"
 
-	_ "github.com/mattn/go-sqlite3"
 	"github.com/gnemade360/go-dal/dal/interfaces"
 )
 
+// Default SQL driver name. Callers using mattn/go-sqlite3 should blank-import
+// it themselves; callers using modernc.org/sqlite (pure-Go, no CGO) should
+// blank-import that and call WithDriver("sqlite") on the provider.
+const defaultDriverName = "sqlite3"
+
 type SQLiteProvider struct {
-	db  *sql.DB
-	dsn string
+	db         *sql.DB
+	dsn        string
+	driverName string
 }
 
+// New returns a SQLiteProvider that opens "sqlite3" by default. Callers must
+// register the underlying driver themselves with a blank import (e.g.
+// `_ "github.com/mattn/go-sqlite3"` or `_ "modernc.org/sqlite"` plus
+// WithDriver("sqlite")). This avoids forcing a CGO dependency on every
+// consumer of go-dal.
 func New() *SQLiteProvider {
-	return &SQLiteProvider{}
+	return &SQLiteProvider{driverName: defaultDriverName}
+}
+
+// WithDriver overrides the database/sql driver name used in sql.Open. Use
+// "sqlite" for modernc.org/sqlite (pure-Go), "sqlite3" for mattn (CGO).
+func (p *SQLiteProvider) WithDriver(name string) *SQLiteProvider {
+	if name != "" {
+		p.driverName = name
+	}
+	return p
 }
 
 func (p *SQLiteProvider) SetDSN(dsn string) {
@@ -23,7 +42,11 @@ func (p *SQLiteProvider) SetDSN(dsn string) {
 }
 
 func (p *SQLiteProvider) Connect(ctx context.Context) error {
-	db, err := sql.Open("sqlite3", p.dsn)
+	driver := p.driverName
+	if driver == "" {
+		driver = defaultDriverName
+	}
+	db, err := sql.Open(driver, p.dsn)
 	if err != nil {
 		return fmt.Errorf("failed to open database: %w", err)
 	}
@@ -96,7 +119,10 @@ func (p *SQLiteProvider) BeginTx(ctx context.Context, opts *sql.TxOptions) (inte
 }
 
 func (p *SQLiteProvider) Driver() string {
-	return "sqlite3"
+	if p.driverName == "" {
+		return defaultDriverName
+	}
+	return p.driverName
 }
 
 func (p *SQLiteProvider) Dialect() interfaces.Dialect {
