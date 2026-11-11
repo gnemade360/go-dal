@@ -2,7 +2,9 @@ package sqlite
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"time"
 
@@ -14,12 +16,15 @@ import (
 // and call WithDriver if using a non-default name.
 const defaultDriverName = "sqlite3"
 
+const lockPollInterval = 50 * time.Millisecond
+
 // Provider implements the migration.Provider interface for SQLite
 type Provider struct {
 	db         *sql.DB
 	dsn        string
 	tableName  string
 	driverName string
+	lockToken  string
 }
 
 // NewProvider creates a new SQLite migration provider
@@ -202,17 +207,72 @@ func (p *Provider) RemoveMigration(ctx context.Context, version int64) error {
 	return nil
 }
 
-// AcquireLock acquires a migration lock (no-op for SQLite in single-connection mode)
+// AcquireLock takes an advisory lock by inserting the single row of the
+// "<table>_lock" table. The primary key lets exactly one migrator's insert
+// succeed; the others retry until timeout or ctx is done. Any insert error is
+// retried (constraint violation or SQLITE_BUSY) because telling them apart
+// would need the driver's error type, and the driver is the caller's choice.
+// If a process dies holding the lock, delete the row by hand to recover.
 func (p *Provider) AcquireLock(ctx context.Context, timeout time.Duration) error {
-	// SQLite handles locking at the database level
-	// For a more robust solution, we could implement application-level locking
-	// using a separate table, but for now, we rely on SQLite's built-in locking
+	token, err := newLockToken()
+	if err != nil {
+		return err
+	}
+
+	lockTable := p.lockTableName()
+	createQuery := fmt.Sprintf(
+		"CREATE TABLE IF NOT EXISTS %s (id INTEGER PRIMARY KEY CHECK (id = 1), holder TEXT NOT NULL, acquired_at TIMESTAMP NOT NULL)",
+		lockTable,
+	)
+	insertQuery := fmt.Sprintf("INSERT INTO %s (id, holder, acquired_at) VALUES (1, ?, ?)", lockTable)
+
+	deadline := time.Now().Add(timeout)
+	for {
+		_, lastErr := p.db.ExecContext(ctx, createQuery)
+		if lastErr == nil {
+			_, lastErr = p.db.ExecContext(ctx, insertQuery, token, time.Now().UTC())
+		}
+		if lastErr == nil {
+			p.lockToken = token
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out after %v waiting for migration lock %s: %w", timeout, lockTable, lastErr)
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(lockPollInterval):
+		}
+	}
+}
+
+// ReleaseLock releases the lock taken by this provider's AcquireLock. It does
+// nothing when this provider does not hold the lock.
+func (p *Provider) ReleaseLock(ctx context.Context) error {
+	if p.lockToken == "" {
+		return nil
+	}
+
+	query := fmt.Sprintf("DELETE FROM %s WHERE id = 1 AND holder = ?", p.lockTableName())
+	if _, err := p.db.ExecContext(ctx, query, p.lockToken); err != nil {
+		return fmt.Errorf("failed to release migration lock: %w", err)
+	}
+	p.lockToken = ""
 	return nil
 }
 
-// ReleaseLock releases the migration lock (no-op for SQLite)
-func (p *Provider) ReleaseLock(ctx context.Context) error {
-	return nil
+func (p *Provider) lockTableName() string {
+	return p.tableName + "_lock"
+}
+
+func newLockToken() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("failed to generate migration lock token: %w", err)
+	}
+	return hex.EncodeToString(b), nil
 }
 
 // SupportsTransactionalDDL returns whether the database supports transactional DDL

@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/url"
+	"strings"
 
 	"github.com/gnemade360/go-dal/dal/interfaces"
 )
@@ -12,6 +14,8 @@ import (
 // it themselves; callers using modernc.org/sqlite (pure-Go, no CGO) should
 // blank-import that and call WithDriver("sqlite") on the provider.
 const defaultDriverName = "sqlite3"
+
+const defaultBusyTimeoutMs = 5000
 
 type SQLiteProvider struct {
 	db         *sql.DB
@@ -46,7 +50,11 @@ func (p *SQLiteProvider) Connect(ctx context.Context) error {
 	if driver == "" {
 		driver = defaultDriverName
 	}
-	db, err := sql.Open(driver, p.dsn)
+	dsn := p.dsn
+	if driver == defaultDriverName {
+		dsn = withMattnDefaults(dsn)
+	}
+	db, err := sql.Open(driver, dsn)
 	if err != nil {
 		return fmt.Errorf("failed to open database: %w", err)
 	}
@@ -62,6 +70,57 @@ func (p *SQLiteProvider) Connect(ctx context.Context) error {
 
 	p.db = db
 	return nil
+}
+
+// withMattnDefaults adds mattn/go-sqlite3 DSN parameters for WAL journaling,
+// a busy timeout and foreign key enforcement. Parameters the caller already
+// set are left alone, so the DSN can override any of them. mattn applies these
+// on every new connection, unlike a one-off PRAGMA after Open.
+func withMattnDefaults(dsn string) string {
+	// mattn only parses parameters when '?' is not the first character, so an
+	// empty DSN must stay empty rather than become a file named "?...".
+	if dsn == "" {
+		return dsn
+	}
+
+	existing := url.Values{}
+	if pos := strings.IndexRune(dsn, '?'); pos >= 0 {
+		parsed, err := url.ParseQuery(dsn[pos+1:])
+		if err != nil {
+			return dsn
+		}
+		existing = parsed
+	}
+	isSet := func(keys ...string) bool {
+		for _, k := range keys {
+			if _, ok := existing[k]; ok {
+				return true
+			}
+		}
+		return false
+	}
+
+	inMemory := strings.Contains(dsn, ":memory:") || strings.Contains(dsn, "mode=memory")
+
+	var add []string
+	if !inMemory && !isSet("_journal_mode", "_journal") {
+		add = append(add, "_journal_mode=WAL")
+	}
+	if !isSet("_busy_timeout", "_timeout") {
+		add = append(add, fmt.Sprintf("_busy_timeout=%d", defaultBusyTimeoutMs))
+	}
+	if !isSet("_foreign_keys", "_fk") {
+		add = append(add, "_foreign_keys=1")
+	}
+	if len(add) == 0 {
+		return dsn
+	}
+
+	sep := "?"
+	if strings.Contains(dsn, "?") {
+		sep = "&"
+	}
+	return dsn + sep + strings.Join(add, "&")
 }
 
 func (p *SQLiteProvider) Close() error {
