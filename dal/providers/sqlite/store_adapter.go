@@ -10,23 +10,34 @@ import (
 	"github.com/gnemade360/go-dal/dal/interfaces"
 )
 
+// executor is satisfied by both the provider and an open transaction, so the
+// same adapter code runs against either.
+type executor interface {
+	Exec(ctx context.Context, query string, args ...interface{}) (interfaces.Result, error)
+	QueryRow(ctx context.Context, query string, args ...interface{}) interfaces.Row
+	Query(ctx context.Context, query string, args ...interface{}) (interfaces.Rows, error)
+}
+
 type StoreAdapter struct {
 	provider *SQLiteProvider
+	db       executor
 }
 
 func NewStoreAdapter(provider *SQLiteProvider) *StoreAdapter {
-	return &StoreAdapter{provider: provider}
+	return &StoreAdapter{provider: provider, db: provider}
 }
 
 func (s *StoreAdapter) FindByID(ctx context.Context, tableName string, id string, dest interface{}) error {
 	d := s.provider.Dialect()
 	query := fmt.Sprintf("SELECT * FROM %s WHERE %s = ?", d.Quote(tableName), d.Quote("id"))
 
-	row := s.provider.QueryRow(ctx, query, id)
+	// Columns must be read before QueryRow: an unscanned row holds its
+	// connection, and the pool has only one.
 	columns, err := s.getTableColumns(ctx, tableName)
 	if err != nil {
 		return err
 	}
+	row := s.db.QueryRow(ctx, query, id)
 
 	values := make([]interface{}, len(columns))
 	ptrs := make([]interface{}, len(columns))
@@ -86,7 +97,7 @@ func (s *StoreAdapter) FindByFilter(ctx context.Context, tableName string, dest 
 		query += " " + limitOffset
 	}
 
-	rows, err := s.provider.Query(ctx, query, args...)
+	rows, err := s.db.Query(ctx, query, args...)
 	if err != nil {
 		return err
 	}
@@ -145,7 +156,7 @@ func (s *StoreAdapter) Count(ctx context.Context, tableName string, filter inter
 	}
 
 	var count int64
-	row := s.provider.QueryRow(ctx, query, args...)
+	row := s.db.QueryRow(ctx, query, args...)
 	if err := row.Scan(&count); err != nil {
 		return 0, err
 	}
@@ -171,7 +182,7 @@ func (s *StoreAdapter) Create(ctx context.Context, tableName string, id string, 
 		strings.Join(placeholders, ", "),
 	)
 
-	_, err := s.provider.Exec(ctx, query, args...)
+	_, err := s.db.Exec(ctx, query, args...)
 	return err
 }
 
@@ -197,7 +208,7 @@ func (s *StoreAdapter) Update(ctx context.Context, tableName string, id string, 
 		d.Quote("id"),
 	)
 
-	result, err := s.provider.Exec(ctx, query, args...)
+	result, err := s.db.Exec(ctx, query, args...)
 	if err != nil {
 		return err
 	}
@@ -216,7 +227,7 @@ func (s *StoreAdapter) Delete(ctx context.Context, tableName string, id string) 
 	d := s.provider.Dialect()
 	query := fmt.Sprintf("DELETE FROM %s WHERE %s = ?", d.Quote(tableName), d.Quote("id"))
 
-	result, err := s.provider.Exec(ctx, query, id)
+	result, err := s.db.Exec(ctx, query, id)
 	if err != nil {
 		return err
 	}
@@ -236,12 +247,12 @@ func (s *StoreAdapter) BeginTx(ctx context.Context) (interfaces.StoreTx, error) 
 	if err != nil {
 		return nil, err
 	}
-	return &sqlStoreTx{tx: tx, adapter: s}, nil
+	return &sqlStoreTx{tx: tx, adapter: &StoreAdapter{provider: s.provider, db: tx}}, nil
 }
 
 func (s *StoreAdapter) getTableColumns(ctx context.Context, tableName string) ([]string, error) {
 	query := fmt.Sprintf("PRAGMA table_info(%s)", s.provider.Dialect().Quote(tableName))
-	rows, err := s.provider.Query(ctx, query)
+	rows, err := s.db.Query(ctx, query)
 	if err != nil {
 		return nil, err
 	}

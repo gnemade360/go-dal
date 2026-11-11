@@ -152,8 +152,35 @@ func (r *StoreRepository[T]) Exists(ctx context.Context, spec Specification) (bo
 	return count > 0, nil
 }
 
+// WithTransaction returns a repository bound to tx when tx carries an
+// interfaces.StoreTx; otherwise it returns r unchanged.
 func (r *StoreRepository[T]) WithTransaction(tx Transaction) Repository[T] {
-	return r
+	storeTx, ok := tx.(interfaces.StoreTx)
+	if !ok {
+		return r
+	}
+	return NewStoreRepository[T](storeTx)
+}
+
+// Transaction runs fn with a repository bound to a new store transaction,
+// committing when fn returns nil and rolling back otherwise.
+func (r *StoreRepository[T]) Transaction(ctx context.Context, fn func(ctx context.Context, repo Repository[T]) error) error {
+	tx, err := r.store.BeginTx(ctx)
+	if err != nil {
+		return err
+	}
+
+	if err := fn(ctx, NewStoreRepository[T](tx)); err != nil {
+		if rbErr := tx.Rollback(); rbErr != nil {
+			return errors.NewError(errors.CodeTransaction, "failed to rollback transaction", rbErr)
+		}
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return errors.NewError(errors.CodeTransaction, "failed to commit transaction", err)
+	}
+	return nil
 }
 
 func entityToMap(entity interface{}) (map[string]interface{}, error) {

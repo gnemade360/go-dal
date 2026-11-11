@@ -10,9 +10,18 @@ import (
 	"github.com/gnemade360/go-dal/dal/types"
 )
 
+// executor runs statements; it is the database outside a transaction and the
+// transaction inside one.
+type executor interface {
+	Query(ctx context.Context, query string, args ...interface{}) (interfaces.Rows, error)
+	QueryRow(ctx context.Context, query string, args ...interface{}) interfaces.Row
+	Exec(ctx context.Context, query string, args ...interface{}) (interfaces.Result, error)
+}
+
 // BaseRepository provides a generic repository implementation
 type BaseRepository[T Entity] struct {
 	db     interfaces.Database
+	exec   executor
 	mapper Mapper[T]
 }
 
@@ -24,6 +33,7 @@ func NewBaseRepository[T Entity](db interfaces.Database, mapper Mapper[T]) *Base
 	
 	return &BaseRepository[T]{
 		db:     db,
+		exec:   db,
 		mapper: mapper,
 	}
 }
@@ -37,7 +47,7 @@ func (r *BaseRepository[T]) FindByID(ctx context.Context, id string) (*T, error)
 		r.db.Dialect().Placeholder(1),
 	)
 	
-	row := r.db.QueryRow(ctx, query, id)
+	row := r.exec.QueryRow(ctx, query, id)
 	entity, err := r.mapper.FromRow(row)
 	if err != nil {
 		if err.Error() == "sql: no rows in result set" {
@@ -58,7 +68,7 @@ func (r *BaseRepository[T]) FindAll(ctx context.Context, opts ...QueryOption) ([
 	
 	query := r.buildSelectQuery(options)
 	
-	rows, err := r.db.Query(ctx, query)
+	rows, err := r.exec.Query(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -97,7 +107,7 @@ func (r *BaseRepository[T]) FindBySpec(ctx context.Context, spec Specification, 
 	// Add ORDER BY, LIMIT, OFFSET
 	query += r.buildQuerySuffix(options)
 
-	rows, err := r.db.Query(ctx, query, args...)
+	rows, err := r.exec.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -146,7 +156,7 @@ func (r *BaseRepository[T]) Create(ctx context.Context, entity *T) error {
 		strings.Join(placeholders, ", "),
 	)
 	
-	result, err := r.db.Exec(ctx, query, args...)
+	result, err := r.exec.Exec(ctx, query, args...)
 	if err != nil {
 		return errors.WrapError(err)
 	}
@@ -200,7 +210,7 @@ func (r *BaseRepository[T]) Update(ctx context.Context, entity *T) error {
 		r.db.Dialect().Placeholder(argIndex),
 	)
 	
-	result, err := r.db.Exec(ctx, query, args...)
+	result, err := r.exec.Exec(ctx, query, args...)
 	if err != nil {
 		return errors.WrapError(err)
 	}
@@ -287,10 +297,7 @@ func (r *BaseRepository[T]) DeleteBatch(ctx context.Context, ids []string) error
 // WithTransaction returns a repository that uses the given transaction
 func (r *BaseRepository[T]) WithTransaction(tx Transaction) Repository[T] {
 	if dbTx, ok := tx.(interfaces.Transaction); ok {
-		return &transactionalRepository[T]{
-			BaseRepository: r,
-			tx:            dbTx,
-		}
+		return r.bindTx(dbTx)
 	}
 	return r
 }
@@ -308,7 +315,7 @@ func (r *BaseRepository[T]) DeleteByID(ctx context.Context, id string) error {
 		r.db.Dialect().Placeholder(1),
 	)
 	
-	result, err := r.db.Exec(ctx, query, id)
+	result, err := r.exec.Exec(ctx, query, id)
 	if err != nil {
 		return errors.WrapError(err)
 	}
@@ -334,7 +341,7 @@ func (r *BaseRepository[T]) DeleteBySpec(ctx context.Context, spec Specification
 		query += " WHERE " + whereClause
 	}
 	
-	result, err := r.db.Exec(ctx, query, args...)
+	result, err := r.exec.Exec(ctx, query, args...)
 	if err != nil {
 		return 0, errors.WrapError(err)
 	}
@@ -355,7 +362,7 @@ func (r *BaseRepository[T]) Count(ctx context.Context, spec Specification) (int6
 	}
 	
 	var count int64
-	row := r.db.QueryRow(ctx, query, args...)
+	row := r.exec.QueryRow(ctx, query, args...)
 	if err := row.Scan(&count); err != nil {
 		return 0, err
 	}
@@ -379,13 +386,7 @@ func (r *BaseRepository[T]) Transaction(ctx context.Context, fn func(ctx context
 		return err
 	}
 	
-	// Create a new repository instance with the transaction
-	txRepo := &transactionalRepository[T]{
-		BaseRepository: r,
-		tx:            tx,
-	}
-	
-	if err := fn(ctx, txRepo); err != nil {
+	if err := fn(ctx, r.bindTx(tx)); err != nil {
 		if rbErr := tx.Rollback(); rbErr != nil {
 			return errors.NewError(errors.CodeTransaction, "failed to rollback transaction", rbErr)
 		}
@@ -463,95 +464,16 @@ func (r *BaseRepository[T]) buildQuerySuffix(options *types.QueryOptions) string
 	return ""
 }
 
-// transactionalRepository wraps BaseRepository for transaction support
+// transactionalRepository is a BaseRepository whose statements run on a
+// transaction instead of the database.
 type transactionalRepository[T Entity] struct {
 	*BaseRepository[T]
-	tx interfaces.Transaction
 }
 
-// Override database operations to use transaction
-func (r *transactionalRepository[T]) FindByID(ctx context.Context, id string) (*T, error) {
-	query := fmt.Sprintf("SELECT %s FROM %s WHERE %s = %s",
-		buildColumnList(r.mapper.Columns(), r.db.Dialect()),
-		r.db.Dialect().Quote(r.mapper.TableName()),
-		r.db.Dialect().Quote("id"),
-		r.db.Dialect().Placeholder(1),
-	)
-	
-	row := r.tx.QueryRow(ctx, query, id)
-	entity, err := r.mapper.FromRow(row)
-	if err != nil {
-		if err.Error() == "sql: no rows in result set" {
-			return nil, errors.ErrNotFound
-		}
-		return nil, err
+func (r *BaseRepository[T]) bindTx(tx interfaces.Transaction) *transactionalRepository[T] {
+	return &transactionalRepository[T]{
+		BaseRepository: &BaseRepository[T]{db: r.db, exec: tx, mapper: r.mapper},
 	}
-	
-	return entity, nil
-}
-
-// FindOne retrieves a single entity matching the specification  
-func (r *transactionalRepository[T]) FindOne(ctx context.Context, spec Specification) (*T, error) {
-	entities, err := r.Find(ctx, spec)
-	if err != nil {
-		return nil, err
-	}
-	if len(entities) == 0 {
-		return nil, errors.ErrNotFound
-	}
-	return entities[0], nil
-}
-
-// Find retrieves entities matching the specification
-func (r *transactionalRepository[T]) Find(ctx context.Context, spec Specification) ([]*T, error) {
-	return r.FindWithOptions(ctx, spec)
-}
-
-// FindWithOptions retrieves entities matching the specification with query options
-func (r *transactionalRepository[T]) FindWithOptions(ctx context.Context, spec Specification, opts ...QueryOption) ([]*T, error) {
-	return r.FindBySpec(ctx, spec, opts...)
-}
-
-// CreateBatch inserts multiple entities in transaction
-func (r *transactionalRepository[T]) CreateBatch(ctx context.Context, entities []*T) error {
-	if len(entities) == 0 {
-		return nil
-	}
-	
-	for _, entity := range entities {
-		if err := r.Create(ctx, entity); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// UpdateBatch updates multiple entities in transaction
-func (r *transactionalRepository[T]) UpdateBatch(ctx context.Context, entities []*T) error {
-	if len(entities) == 0 {
-		return nil
-	}
-	
-	for _, entity := range entities {
-		if err := r.Update(ctx, entity); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// DeleteBatch removes multiple entities by IDs in transaction
-func (r *transactionalRepository[T]) DeleteBatch(ctx context.Context, ids []string) error {
-	if len(ids) == 0 {
-		return nil
-	}
-	
-	for _, id := range ids {
-		if err := r.Delete(ctx, id); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // WithTransaction returns self as it's already a transactional repository
